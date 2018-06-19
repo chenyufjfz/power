@@ -20,7 +20,7 @@ static uint32_t f0, f_var;
 #define F0_DEFAULT_CYCLE CPU_CLOCK
 #define F0VAR_MAX (F0_DEFAULT_CYCLE / 10)
 
-#define USEECAP     1
+#define USEECAP     6
 
 #if USEECAP == 1
 static volatile ECAP_REGS * ecap = &ECap1Regs;
@@ -34,6 +34,11 @@ static volatile ECAP_REGS * ecap = &ECap4Regs;
 static volatile ECAP_REGS * ecap = &ECap5Regs;
 #elif USEECAP == 6
 static volatile ECAP_REGS * ecap = &ECap6Regs;
+#endif
+
+#define SIM1PPS_FREE_SOFT 0
+#if SIM1PPS_FREE_SOFT > 1
+#error SIM1PPS_FREE_SOFT > 1
 #endif
 
 static interrupt void ecap_1pps_isr(void)
@@ -50,7 +55,7 @@ static interrupt void ecap_1pps_isr(void)
 void Sim1PPS::init()
 {
     EALLOW;
-
+    ecap->ECCTL1.bit.FREE_SOFT = SIM1PPS_FREE_SOFT * 3; //free run or stop when emulation event
     ecap->ECCTL2.all = 0x2C6;     // Stop counter
     /*
     CONT_ONESHT=0       0 Continuous or one-shot

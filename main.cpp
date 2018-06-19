@@ -6,11 +6,12 @@
 
 #include "task.h"
 
-volatile int16_t event_pending;
+volatile int16_t event_pending = 0;
 
 Task * all_task[] = {
                     & msg_task,
-                    & adc_sync_1pps
+                    & adc_sync_1pps,
+                    & utc_sync
 };
 /**********************************************************************
 * Function: main()
@@ -52,6 +53,8 @@ void main(void)
     CpuSysRegs.SECMSEL.bit.PF1SEL = 1;  // Ensure DMA is connected to Peripheral Frame 1 bridge which contains the DAC
 
     DmaRegs.DMACTRL.bit.HARDRESET = 1;  // Perform a hard reset on DMA
+
+    DmaRegs.DEBUGCTRL.bit.FREE = 1;     // Allow DMA to run free on emulation suspend
 
     // Configure the prescaler to the ePWM modules.  Max ePWM input clock is 100 MHz.
     ClkCfgRegs.PERCLKDIVSEL.bit.EPWMCLKDIV = 0;     // EPWMCLK divider from PLLSYSCLK.  0=/1, 1=/2

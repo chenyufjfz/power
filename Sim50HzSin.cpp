@@ -11,9 +11,9 @@
 #ifdef _SIM50HZ_SIN_WITH_PWM_
 #include "math.h"
 
+#undef SIN_TABLE_SIZE
 #define SIN_TABLE_SIZE 200
 #define TIMER_50HZ (CPU_CLOCK / 50 / SIN_TABLE_SIZE)
-#define PI 3.14159265
 
 #define DMA_CHANNEL  3
 #if DMA_CHANNEL == 1
@@ -42,6 +42,11 @@ static volatile EPWM_REGS * epwm = &EPwm3Regs;
 Sim50HzSin sim50hz_sin;
 static uint16_t sine_tbl[SIN_TABLE_SIZE];
 
+#define SIM50HZ_FREE_SOFT 0
+#if SIM50HZ_FREE_SOFT > 1
+#error SIM50HZ_FREE_SOFT > 1
+#endif
+
 static void dac_init()
 {
     EALLOW;
@@ -58,7 +63,6 @@ static void dac_init()
 static void dma_init()
 {
     EALLOW;
-    DmaRegs.DEBUGCTRL.bit.FREE = 1;     // Allow DMA to run free on emulation suspend
 
     // Set up SOURCE address:
     //
@@ -90,17 +94,25 @@ static void dma_init()
     dma_ch->DST_WRAP_STEP = 0; // Step for destination wrap
 
 #if USE_EPWM == 1
-    DmaClaSrcSelRegs.DMACHSRCSEL1.bit.CH1 = DMA_EPWM1A; //DMA_TINT0;      // persel - Source select
+    int trig_source = DMA_EPWM1A;    // persel - Source select
 #elif USE_EPWM == 2
-    DmaClaSrcSelRegs.DMACHSRCSEL1.bit.CH1 = DMA_EPWM2A; // persel - Source select
+    int trig_source = DMA_EPWM2A;    // persel - Source select
 #elif USE_EPWM == 3
-    DmaClaSrcSelRegs.DMACHSRCSEL1.bit.CH1 = DMA_EPWM3A; // persel - Source select
+    int trig_source = DMA_EPWM3A;    // persel - Source select
+#endif
+
+#if DMA_CHANNEL == 1
+    DmaClaSrcSelRegs.DMACHSRCSEL1.bit.CH1 = trig_source; // persel - Source select
+#elif DMA_CHANNEL == 2
+    DmaClaSrcSelRegs.DMACHSRCSEL1.bit.CH2 = trig_source; // persel - Source select
+#elif DMA_CHANNEL == 3
+    DmaClaSrcSelRegs.DMACHSRCSEL1.bit.CH3 = trig_source; // persel - Source select
 #endif
     // Set up MODE Register:
     //
-    dma_ch->MODE.all = 0xb01;
-
-  /*PERINTSEL:5 =1       4:0  Peripheral Interrupt and Sync Select
+    dma_ch->MODE.all = 0xb00;
+    dma_ch->MODE.bit.PERINTSEL = DMA_CHANNEL;
+  /*PERINTSEL:5 =DMA     4:0  Peripheral Interrupt and Sync Select
     rsvd1:2              6:5  Reserved
     OVRINTE:1   =0       7    Overflow Interrupt Enable
     PERINTE:1   =1       8    Peripheral Interrupt Enable
@@ -169,7 +181,8 @@ static void epwm_init()
 #endif
     EDIS;
 
-    epwm->TBCTL.all = 0xC033;           // Configure timer control register
+    epwm->TBCTL.all = 0x0033;           // Configure timer control register
+    epwm->TBCTL.bit.FREE_SOFT = SIM50HZ_FREE_SOFT * 3;
     // bit 15-14     11:     FREE/SOFT, 11 = ignore emulation suspend
     // bit 13        0:      PHSDIR, 0 = count down after sync event
     // bit 12-10     000:    CLKDIV, 000 => TBCLK = HSPCLK/1, 111 => 8
