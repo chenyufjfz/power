@@ -43,7 +43,7 @@ static volatile EPWM_REGS * epwm = &EPwm5Regs;
 #define GPIO_EWPM 8
 #endif
 
-#define USE_ADC 2
+#define USE_ADC 1
 #if USE_ADC == 1
 static volatile ADC_REGS * adc = &AdcaRegs;
 static volatile ADC_RESULT_REGS * adc_result = &AdcaResultRegs;
@@ -75,8 +75,27 @@ static volatile CH_REGS * dma_ch = &DmaRegs.CH3;
 #define DEFAULT_SAMPLE_PERIOD (CPU_CLOCK / SAMPLE_RATE)
 #define SIN_AMP_BIT 11
 #define SIN_AMP ((1 << SIN_AMP_BIT) - 1)
+#define MAX_CLOCK_DIFF (CPU_CLOCK / 1000000 * MAX_CLOCK_JITTER)
 
-#define RESERVER_LEN 5
+
+#define ADC_DMA_TRANSFER_SIZE (SAMPLE_RATE / COMPUTE_RATE)
+#define ADC_DMA_CLUSTER_SIZE (ADC_DMA_TRANSFER_SIZE * CHANNEL)
+#define SIN_TABLE_SIZE (SAMPLE_RATE / (POWER_CYCLE * 4) + 1)
+#define COMPUTE_BUF_SIZE (SAMPLE_RATE / POWER_CYCLE * COMPUTE_CYCLE * CHANNEL)
+#define ADC_DMA_CLUSTER_COUNT ( (COMPUTE_BUF_SIZE - 1) / ADC_DMA_CLUSTER_SIZE + 3 + BUF_DMA_RESERVED_COUNT)
+#define ADC_BUF_SIZE (ADC_DMA_CLUSTER_SIZE * ADC_DMA_CLUSTER_COUNT)
+
+#define VI_SHIFT_BIT 9
+#if ((1 << VI_SHIFT_BIT) < (SIN_TABLE_SIZE - 1) * 4 * COMPUTE_CYCLE)
+#error  ((1 << VI_SHIFT_BIT) < (SIN_TABLE_SIZE - 1) * 4 * COMPUTE_CYCLE)
+#error
+#endif
+
+#define VI_SHIFT_BIT2 (VI_SHIFT_BIT - (32 - ADC_RESOLUTION - SIN_AMP_BIT - 1))
+#if VI_SHIFT_BIT2 < 0
+#undef VI_SHIFT_BIT2
+#define VI_SHIFT_BIT2 0
+#endif
 static uint32_t tick_h32 = 0;
 enum {
     CAPTURE_NONE,
@@ -89,7 +108,9 @@ enum {
     SYNC_INIT,
     SYNC_INIT2,
     SYNC_DMA,
-    SYNC_FREQ,
+    SYNC_UTC0,
+    SYNC_UTC1,
+    SYNC_UTC2,
 };
 static __interrupt void ecap0_isr(void)
 {
@@ -419,7 +440,7 @@ static void dma_init(uint16_t * buf)
     //
     dma_ch->SRC_WRAP_SIZE = ADC_DMA_TRANSFER_SIZE - 1; // Wrap source address after N bursts, equal to TRANSFER_SIZE disable WARP
     dma_ch->SRC_WRAP_STEP = 0; // Step for source wrap
-    dma_ch->DST_WRAP_SIZE = 0; // Wrap destination address after  N bursts.
+    dma_ch->DST_WRAP_SIZE = ADC_DMA_TRANSFER_SIZE - 1; // Wrap destination address after  N bursts.
     dma_ch->DST_WRAP_STEP = 0; // Step for destination wrap
 
 
@@ -470,17 +491,408 @@ static void dma_init(uint16_t * buf)
 /*
  * Inout sin_tbl, store sin value in sin_tbl
  */
-static void sin_table_init(int16_t * sin_tbl)
+static void sin_table_init(int16_t * sin_tbl, int sin_tbl_size)
 {
-    for (int i=0; i<SIN_TABLE_SIZE-1; i++) {
-        sin_tbl[i] = sin(i * PI/2/(SIN_TABLE_SIZE - 1)) * SIN_AMP;
+    for (int i=0; i<sin_tbl_size-1; i++) {
+        sin_tbl[i] = sin(i * PI/2/(sin_tbl_size - 1)) * SIN_AMP;
     }
-    sin_tbl[SIN_TABLE_SIZE - 1] = SIN_AMP;
+    sin_tbl[sin_tbl_size - 1] = SIN_AMP;
+}
+
+struct VIBuf {
+    union {
+        uint64_t tick;
+        uint64_t sample;
+        uint64_t utc;
+    } t;
+    int16_t vi[CHANNEL][2];
+};
+
+class ComputeVI {
+protected:
+    int16_t sin_tbl[SIN_TABLE_SIZE];
+    uint16_t adc_buf[ADC_BUF_SIZE];
+    volatile uint64_t adc_sample_tail;
+public:
+    void init();
+    void new_cluster_ready();
+    uint64_t get_latest_sample() const {
+        return adc_sample_tail;
+    }
+    uint64_t get_earliest_sample() const {
+        return adc_sample_tail - ADC_BUF_SIZE + 2;
+    }
+    int operator () (VIBuf & vibuf);
+} compute_vi;
+
+void ComputeVI::init()
+{
+    adc_sample_tail = 0;
+    sin_table_init(sin_tbl, SIN_TABLE_SIZE);
+    dma_init(adc_buf);
+}
+
+//it run at interrupt context
+void ComputeVI::new_cluster_ready()
+{
+    adc_sample_tail +=ADC_DMA_CLUSTER_SIZE;
+    uint32_t addr = (uint32_t) &adc_buf[adc_sample_tail % ADC_BUF_SIZE];
+    EALLOW;
+    dma_ch->DST_ADDR_SHADOW = addr;
+    dma_ch->DST_BEG_ADDR_SHADOW = addr;
+    EDIS;
+}
+
+enum {
+    COMPUTEVI_INTIME,
+    COMPUTEVI_LATE,
+    COMPUTEVI_EARLY,
+};
+/* Main compute function, it doesn't run at interrupt context
+ * Inout: vibuf
+ *        vibuf.sample, In: the expected sample wanted; Out: the actual sample
+ * Return 0, in valid time
+ *        1, too late
+ *        2, too early
+ */
+int ComputeVI::operator() (VIBuf & vibuf)
+{
+    uint64_t valid_tail = adc_sample_tail - ADC_DMA_CLUSTER_SIZE;
+    uint64_t valid_head = adc_sample_tail - ADC_BUF_SIZE + 2;
+
+    if (vibuf.t.sample < valid_head) {
+        vibuf.t.sample = valid_head;
+        return COMPUTEVI_LATE;
+    }
+    if (vibuf.t.sample + COMPUTE_BUF_SIZE - 1 > valid_tail) {
+        vibuf.t.sample = valid_head;
+        return COMPUTEVI_EARLY;
+    }
+
+    uint16_t * head_sample = &adc_buf[(vibuf.t.sample * CHANNEL) % ADC_BUF_SIZE];
+    int32_t vi[CHANNEL][2] = {0};
+    for (int phase=0; phase<=3; phase++) {
+        int16_t * psin;
+        int16_t * pcos;
+        int ds;
+        switch (phase) {
+        case 0:
+            psin = &sin_tbl[0];
+            pcos = &sin_tbl[SIN_TABLE_SIZE - 1];
+            ds = 1;
+            break;
+        case 1:
+            psin = &sin_tbl[SIN_TABLE_SIZE - 1];
+            pcos = &sin_tbl[0];
+            ds = -1;
+            break;
+        case 2:
+            psin = &sin_tbl[0];
+            pcos = &sin_tbl[SIN_TABLE_SIZE - 1];
+            ds = 1;
+            break;
+        case 3:
+            psin = &sin_tbl[SIN_TABLE_SIZE - 1];
+            pcos = &sin_tbl[0];
+            ds = -1;
+            break;
+        }
+        int loop_len = min(SIN_TABLE_SIZE - 1, (&adc_buf[ADC_BUF_SIZE] - head_sample) / CHANNEL);
+        int32_t vi1[CHANNEL][2] = {0};
+        for (int i=0; i<loop_len; i++, psin += ds, pcos -= ds) {
+            for (int j=0; j<CHANNEL; j++) {
+                vi1[j][0] += __mpyxu(*psin, *head_sample);
+                vi1[j][1] += __mpyxu(*pcos, *head_sample++);
+            }
+        }
+        if (head_sample == &adc_buf[ADC_BUF_SIZE]) {
+            head_sample = adc_buf; //turn round
+            loop_len = SIN_TABLE_SIZE - 1 -loop_len;
+            for (int i=0; i<loop_len; i++, psin += ds, pcos -= ds) {
+                for (int j=0; j<CHANNEL; j++) {
+                    vi1[j][0] += __mpyxu(*psin, *head_sample);
+                    vi1[j][1] += __mpyxu(*pcos, *head_sample++);
+                }
+            }
+        }
+        for (int j=0; j<CHANNEL; j++) {
+            switch (phase) {
+            case 0:
+                vi[j][0] +=vi1[j][0] >> VI_SHIFT_BIT2;
+                vi[j][1] +=vi1[j][1] >> VI_SHIFT_BIT2;
+                break;
+            case 1:
+                vi[j][0] +=vi1[j][0] >> VI_SHIFT_BIT2;
+                vi[j][1] -=vi1[j][1] >> VI_SHIFT_BIT2;
+                break;
+            case 2:
+                vi[j][0] -=vi1[j][0] >> VI_SHIFT_BIT2;
+                vi[j][1] -=vi1[j][1] >> VI_SHIFT_BIT2;
+                break;
+            case 3:
+                vi[j][0] -=vi1[j][0] >> VI_SHIFT_BIT2;
+                vi[j][1] +=vi1[j][1] >> VI_SHIFT_BIT2;
+                break;
+            }
+        }
+    }
+
+    for (int j=0; j<CHANNEL; j++) { //A * sin(t+phase)
+        int x = vi[j][0] >> 16; //sin
+        int y = vi[j][1] >> 16; //cos
+        vibuf.vi[j][0] = sqrt(y * y + x * x); //it is A
+        vibuf.vi[j][1] = atan2(vi[j][1], vi[j][0]) / PI * 18000; //it is phase
+    }
+    return COMPUTEVI_INTIME;
+}
+
+/*
+ * Input t0,
+ * Input t1,
+ * Input _tick_ps
+ * Input max_diff
+ * It t0 and t1 is compatible, return true else false
+ */
+bool ADCSync1PPS::compatible(const TickTime & t0, const TickTime & t1, uint32_t _tick_ps, uint32_t max_diff)
+{
+    int64_t time_diff, expect_tick_diff, tick_diff;
+    if (t1.utc > t0.utc) {
+        time_diff = t1.utc - t0.utc;
+        expect_tick_diff = time_diff * _tick_ps / UTC_UNIT;
+        tick_diff = t1.tick - t0.tick;
+    } else {
+        time_diff = t0.utc - t1.utc;
+        expect_tick_diff = time_diff * _tick_ps / UTC_UNIT;
+        tick_diff = t0.tick - t1.tick;
+    }
+    return (abs(expect_tick_diff - tick_diff) < max_diff);
+}
+
+void ADCSync1PPS::clear_utc_sync_tbl()
+{
+    for (int i=0; i<UTCSYNC_SIZE; i++) {
+        utc_sync_tbl[i].tick = 0;
+        utc_sync_tbl[i].utc = 0;
+    }
+}
+
+void ADCSync1PPS::push_utc_sync_tbl(uint64_t tick, uint64_t utc)
+{
+    for (int i=0; i<UTCSYNC_SIZE-1; i++)
+        utc_sync_tbl[i] = utc_sync_tbl[i+1];
+
+    utc_sync_tbl[UTCSYNC_SIZE-1].tick = tick;
+    utc_sync_tbl[UTCSYNC_SIZE-1].utc = utc;
+}
+
+void ADCSync1PPS::clear_dma_sync_tbl()
+{
+    for (int i=0; i<DMASYNC_SIZE; i++) {
+        dma_sync_tbl[i].sample_idx = 0;
+        dma_sync_tbl[i].tick = 0;
+        dma_sync_tbl[i].sample_period = DEFAULT_SAMPLE_PERIOD;
+    }
+}
+
+void ADCSync1PPS::push_dma_sync_tbl(int sample_period, uint64_t sample_idx, uint64_t tick)
+{
+    for (int i=0; i<DMASYNC_SIZE-1; i++)
+        dma_sync_tbl[i] = dma_sync_tbl[i+1];
+
+    dma_sync_tbl[DMASYNC_SIZE-1].tick = tick;
+    dma_sync_tbl[DMASYNC_SIZE-1].sample_period = sample_period;
+    dma_sync_tbl[DMASYNC_SIZE-1].sample_idx = sample_idx;
+}
+
+void ADCSync1PPS::update_tick_ps()
+{
+    uint64_t time_diff, tick_diff;
+    uint32_t new_tick_ps;
+
+    time_diff = utc_sync_tbl[UTCSYNC_SIZE-1].utc - utc_sync_tbl[UTCSYNC_SIZE-2].utc;
+    tick_diff = utc_sync_tbl[UTCSYNC_SIZE-1].tick - utc_sync_tbl[UTCSYNC_SIZE-2].tick;
+    new_tick_ps = tick_diff * 1000 / time_diff;
+    tick_ps = (tick_ps * 3 + new_tick_ps) / 4;
+}
+
+#define COMPUTE_PERIOD (UTC_UNIT / COMPUTE_RATE)
+#if UTC_UNIT % COMPUTE_RATE != 0
+#error UTC_UNIT % COMPUTE_RATE != 0
+#endif
+
+void ADCSync1PPS::update_record_utc()
+{
+    uint64_t sample = compute_vi.get_earliest_sample();
+    sample2utc(sample, record_utc);
+    record_utc = record_utc / COMPUTE_PERIOD;  //here record_utc is compute cycles
+    record_utc = (record_utc + 1) * COMPUTE_PERIOD; //conver record_utc to time
+    printf("update_record_utc %lld", record_utc);
+}
+/*
+ * In tick
+ * Return sample
+ */
+uint64_t ADCSync1PPS::tick2sample(uint64_t tick)
+{
+    for (int i=DMASYNC_SIZE-1; i>=0; i--)
+        if (tick >= dma_sync_tbl[i].tick && dma_sync_tbl[i].tick!=0) {
+            uint64_t ret = (tick - dma_sync_tbl[i].tick + dma_sync_tbl[i].sample_period / 2) / dma_sync_tbl[i].sample_period;
+            return ret + dma_sync_tbl[i].sample_idx;
+        }
+    return 0;
+}
+
+/*
+ * In sample
+ * Return tick
+ */
+uint64_t ADCSync1PPS::sample2tick(uint64_t sample)
+{
+    for (int i=DMASYNC_SIZE-1; i>=0; i--)
+        if (sample >= dma_sync_tbl[i].sample_idx && dma_sync_tbl[i].tick!=0) {
+            uint64_t ret = (sample - dma_sync_tbl[i].sample_idx) * dma_sync_tbl[i].sample_period;
+            return ret + dma_sync_tbl[i].tick;
+        }
+    return 0;
+}
+
+enum {
+    PERFECT_ESTIMATE,
+    FUTURE_ESTIMATE,
+    PAST_ESTIMATE,
+    WRONG_ESTIMATE
+};
+/*
+ * In tick
+ * Out utc
+ * Return 0, perfect estimate
+ *        1, future estimate
+ *        2, past estimate
+ *        3, wrong estimate
+ */
+#define LIMIT_TICK_TH 0x80000000000
+#define LIMIT_UTC_TH (LIMIT_TICK_TH / CPU_CLOCK * UTC_UNIT)
+template <class UTC_TYPE> int ADCSync1PPS::tick2utc(uint64_t tick, UTC_TYPE & utc)
+{
+    int ret, i;
+    for (i=UTCSYNC_SIZE-1; i>=0; i--) {
+        if (utc_sync_tbl[i].tick==0) {
+            i=i+1;
+            break;
+        }
+        if (tick >= utc_sync_tbl[i].tick) {
+            if (i==UTCSYNC_SIZE-1) {
+                if (tick - utc_sync_tbl[i].tick > LIMIT_TICK_TH) {
+                    utc = 0;
+                    return WRONG_ESTIMATE;
+                }
+                utc = (UTC_TYPE) (tick - utc_sync_tbl[i].tick) * UTC_UNIT / tick_ps;
+                ret = FUTURE_ESTIMATE;
+            } else {
+                utc = (UTC_TYPE) (tick - utc_sync_tbl[i].tick) * (utc_sync_tbl[i+1].utc - utc_sync_tbl[i].utc) / (utc_sync_tbl[i+1].tick - utc_sync_tbl[i].tick);
+                ret = PERFECT_ESTIMATE;
+            }
+            utc += utc_sync_tbl[i].utc;
+            return ret;
+        }
+    }
+    if (i<0)
+        i=0;
+    if (i == UTCSYNC_SIZE || utc_sync_tbl[i].tick == 0 || utc_sync_tbl[i].tick - tick > LIMIT_TICK_TH) {
+        utc = 0;
+        return WRONG_ESTIMATE;
+    }
+
+    utc = (UTC_TYPE) (utc_sync_tbl[i].tick - tick) * UTC_UNIT / tick_ps;
+    Assert(utc < utc_sync_tbl[i].utc);
+    utc = utc_sync_tbl[i].utc - utc;
+    return PAST_ESTIMATE;
+}
+
+/*
+ * In utc
+ * Out tick
+ * Return 0, perfect estimate
+ *        1, future estimate
+ *        2, past estimate
+ *        3, wrong estimate
+ */
+template <class UTC_TYPE> int ADCSync1PPS::utc2tick(UTC_TYPE utc, uint64_t & tick)
+{
+    int ret, i;
+    for (i=UTCSYNC_SIZE-1; i>=0; i--) {
+        if (utc_sync_tbl[i].tick==0) {
+            i=i+1;
+            break;
+        }
+        if (utc >= utc_sync_tbl[i].utc) {
+            if (i==UTCSYNC_SIZE-1) {
+                if (utc - utc_sync_tbl[i].utc > LIMIT_UTC_TH) {
+                    tick = 0;
+                    return WRONG_ESTIMATE;
+                }
+                tick = (utc - utc_sync_tbl[i].utc) * tick_ps / UTC_UNIT;
+                ret = FUTURE_ESTIMATE;
+            } else {
+                tick = (utc - utc_sync_tbl[i].utc) * (utc_sync_tbl[i+1].tick - utc_sync_tbl[i].tick) / (utc_sync_tbl[i+1].utc - utc_sync_tbl[i].utc);
+                ret = PERFECT_ESTIMATE;
+            }
+            tick += utc_sync_tbl[i].tick;
+            return ret;
+        }
+    }
+    if (i<0)
+        i=0;
+    if (i == UTCSYNC_SIZE ||utc_sync_tbl[i].tick == 0 || utc_sync_tbl[i].utc - utc > LIMIT_UTC_TH) {
+        tick = 0;
+        return WRONG_ESTIMATE;
+    }
+    tick = (utc_sync_tbl[i].utc - utc) * tick_ps / UTC_UNIT;
+    Assert(tick < utc_sync_tbl[i].tick);
+    tick = utc_sync_tbl[i].tick - tick;
+    return PAST_ESTIMATE;
+}
+
+/*
+ * In sample
+ * Out utc
+ * Return 0, perfect estimate
+ *        1, future estimate
+ *        2, past estimate
+ *        3, wrong estimate
+ */
+template <class UTC_TYPE> int ADCSync1PPS::sample2utc(uint64_t sample, UTC_TYPE & utc)
+{
+    uint64_t tick = sample2tick(sample);
+    if (tick==0)
+        return WRONG_ESTIMATE;
+    return tick2utc(tick, utc);
+}
+
+/*
+ * In utc
+ * Out sample
+ * Return 0, perfect estimate
+ *        1, future estimate
+ *        2, past estimate
+ *        3, wrong estimate
+ */
+template <class UTC_TYPE> int ADCSync1PPS::utc2sample(UTC_TYPE utc, uint64_t & sample)
+{
+    uint64_t tick;
+    int ret = utc2tick(utc, tick);
+    if (ret != WRONG_ESTIMATE) {
+        sample = tick2sample(tick);
+        if (sample == 0)
+            ret = WRONG_ESTIMATE;
+    }
+    return ret;
 }
 
 //Input cap_state
 void ADCSync1PPS::set_cap_state(uint16_t cap_state)
 {
+    EALLOW;
     capture_state = cap_state;
     switch (cap_state) {
     case CAPTURE_NONE:
@@ -503,6 +915,7 @@ void ADCSync1PPS::set_cap_state(uint16_t cap_state)
         ecap0->ECEINT.bit.CEVT1 = 1;
         break;
     }
+    EDIS;
 }
 
 //it runs at interrupt context
@@ -520,13 +933,19 @@ void ADCSync1PPS::new_cap_evt()
     switch (sync_state) {
     case SYNC_ENTER:
         break;
-    case SYNC_INIT:
+    case SYNC_INIT: //receive EPWM interrupt
         sync_state = SYNC_INIT2;
         ecap0->ECEINT.all = 0x20; //only enable overflow disable CAP1
         //set ecap0 to continuous mode, still monitor epwm signal until next DMA interrupt happen
         ecap0->ECCTL2.bit.CONT_ONESHT = 0;
         break;
-    case SYNC_FREQ:
+    case SYNC_UTC0:
+    case SYNC_UTC1:
+    case SYNC_UTC2:
+        if (capture_state == CAPTURE_1PPS) {
+            receive_1pps = true;
+            event_pending |= ADCSYNC_EVENT_MASK;
+        }
         break;
     case SYNC_INIT2:
     case SYNC_DMA:
@@ -544,28 +963,30 @@ void ADCSync1PPS::new_cap_evt()
 void ADCSync1PPS::new_cluster_ready()
 {
     switch (sync_state) {
-    case SYNC_INIT:
-        Assert(0);
     case SYNC_INIT2:
         sync_state = SYNC_DMA;
         return;
     case SYNC_DMA:
     {
         cap1 = ecap0->CAP1; //assume tick_h32 is 0
-        uint32_t diff = cap1 - dma_sync[0].tick;
-        Assert(diff == ADC_DMA_TRANSFER_SIZE * (uint32_t) dma_sync[0].sample_period);
-        sync_state = SYNC_FREQ;
+        uint32_t diff = cap1 - dma_sync_tbl[0].tick;
+        Assert(diff % (ADC_DMA_TRANSFER_SIZE * (uint32_t) dma_sync_tbl[0].sample_period) == 0);
+        compute_vi.new_cluster_ready();
+        if (compute_vi.get_latest_sample() >= ADC_BUF_SIZE)
+            sync_state = SYNC_UTC0;
         return;
     }
-    case SYNC_FREQ:
+    case SYNC_UTC0:
+    case SYNC_UTC1:
+    case SYNC_UTC2:
+        compute_vi.new_cluster_ready();
+        event_pending |= ADCSYNC_EVENT_MASK;
         return;
+    case SYNC_INIT:
     default:
-        return;
+            Assert(0);
     }
 
-    adc_buf_tail++;
-    dma_ch->DST_ADDR_SHADOW = (Uint32) &(adc_buf[adc_buf_tail % ADC_DMA_CLUSTER_COUNT]);
-    event_pending |= ADCSYNC_EVENT_MASK;
 }
 
 uint64_t ADCSync1PPS::get_tick()
@@ -596,15 +1017,17 @@ void ADCSync1PPS::print_helper()
 
 void ADCSync1PPS::init()
 {
-    adc_buf_head = 0;
-    adc_buf_tail = 0;
     keep_display = false;
     capture_state = CAPTURE_EPWM;
     sync_state = SYNC_ENTER;
+    clear_utc_sync_tbl();
+    clear_dma_sync_tbl();
+    record_utc = 0;
+    tick_ps = CPU_CLOCK;
+    receive_1pps = false;
     adc_init();
-    sin_table_init(sin_tbl);
+    compute_vi.init();
     init_xbar_gpio();
-    dma_init(adc_buf);
     ecap_init();
     epwm_init();
     event_pending |= ADCSYNC_EVENT_MASK;
@@ -632,39 +1055,94 @@ void ADCSync1PPS::process_event()
         while (sync_state == SYNC_INIT || sync_state == SYNC_INIT2);    // hold CPU until ecap and dma interrupt finish
 
         //recording 1st sample time base
-        dma_sync[0].sample_idx = 0;
-        dma_sync[0].tick = cap1;
-        dma_sync[0].sample_period = DEFAULT_SAMPLE_PERIOD;
+        dma_sync_tbl[0].sample_idx = 0;
+        dma_sync_tbl[0].tick = cap1;
+        dma_sync_tbl[0].sample_period = DEFAULT_SAMPLE_PERIOD;
 
         IER = 0x40;
         //now sync== SYNC_DMA, and ecap cap1 interrupt is disabled
-        while (sync_state == SYNC_DMA); //  // hold CPU until dma interrupt finish
+        while (sync_state == SYNC_DMA); // hold CPU until dma interrupt finish
 
-        //now sync==SYNC_FREQ
+        Assert(sync_state == SYNC_UTC0); //now sync==SYNC_UTC0
         set_cap_state(CAPTURE_1PPS);
 
         IER = old_ier;
 
-        printf("1st dma sample time=%lu:%lu\n\r", (uint32_t) (dma_sync[0].tick >> 32), (uint32_t) (dma_sync[0].tick & 0xffffffff));
+        printf("1st dma sample time=%lu:%lu\n\r", (uint32_t) (dma_sync_tbl[0].tick >> 32), (uint32_t) (dma_sync_tbl[0].tick & 0xffffffff));
     }
+    bool finish=false;
 
-    uint64_t a = 1;
-    uint64_t b = 3;
-    uint64_t c = a;
-    uint64_t tb, te;
-    uint32_t td;
-    tb = get_tick();
-    for (int i=0; i<100; i++)
-        c = c + b;
-    te = get_tick();
-    td = te - tb;
-    uint64_t d = c;
-    printf("%lu, c=%lx:%lx\n\r", td, (uint32_t) (d >> 32), (uint32_t) (d & 0xffffffff));
-    tb = get_tick();
-    te = get_tick();
-    td = te - tb;
-    d = c;
-    printf("%lu, c=%lx:%lx\n\r", td, (uint32_t) (d >> 32), (uint32_t) (d & 0xffffffff));
+    while (!finish) {
+        finish = true;
+        if (receive_1pps) {
+            receive_1pps = false;
+            uint64_t utc = utc_sync.get_1pps_utctime(cap1, tick_ps);
+            switch (sync_state) {
+            case SYNC_UTC0:
+                if (utc!=0 && utc!=0xffffffffffffffff) {
+                    push_utc_sync_tbl(cap1, utc);
+                    update_record_utc();
+                    sync_state = SYNC_UTC1;
+                }
+                break;
+            case SYNC_UTC1:
+            case SYNC_UTC2:
+                if (utc==0) {
+                    clear_utc_sync_tbl();
+                    sync_state = SYNC_UTC0;
+                }
+                else
+                if (utc!=0xffffffffffffffff) {
+                    if (!compatible(utc_sync_tbl[UTCSYNC_SIZE - 1], TickTime(cap1, utc), tick_ps, MAX_CLOCK_DIFF)) {
+                        clear_utc_sync_tbl();
+                        update_record_utc();
+                        sync_state = SYNC_UTC1;
+                    }
+                    else {
+                        sync_state = SYNC_UTC2;
+                        update_tick_ps();
+                    }
+                    push_utc_sync_tbl(cap1, utc);
+                }
+                break;
+            }
+        }
+
+        if (sync_state == SYNC_UTC1 || sync_state == SYNC_UTC2) {
+            uint64_t sample;
+            int ret = utc2sample(record_utc, sample);
+            if (ret != WRONG_ESTIMATE) {
+                VIBuf vibuf;
+                vibuf.t.sample = sample;
+                ret = compute_vi(vibuf);
+                if (ret == COMPUTEVI_LATE) {
+                    update_record_utc();
+                    finish = false;
+                }
+                if (ret == COMPUTEVI_EARLY) {
+                    if (sample > compute_vi.get_latest_sample()) {
+                        update_record_utc();
+                        finish = false;
+                    }
+                }
+                if (ret == COMPUTEVI_INTIME) {
+                    long double actual_utc;
+                    sample2utc(vibuf.t.sample, actual_utc);
+                    actual_utc -= record_utc;
+                    int16_t phase_adjust = actual_utc * (POWER_CYCLE * 36000 / UTC_UNIT);
+                    for (int j=0; j<CHANNEL; j++)
+                        vibuf.vi[j][1] -= phase_adjust;
+                    if (record_utc % 1000 == 0) {
+                        for (int j=0; j<CHANNEL; j++)
+                            printf("(%d,%d),", vibuf.vi[j][0], vibuf.vi[j][1]);
+                        printf("\n\r");
+                    }
+                    record_utc = record_utc + COMPUTE_PERIOD;
+                    finish = false;
+                }
+            }
+        }
+    }
 }
 
 int ADCSync1PPS::process_cmd(char * user_cmd)

@@ -241,7 +241,7 @@ void Sim50HzSin::init()
 
 void Sim50HzSin::print_helper()
 {
-    printf("Sim50HzSin\n\r");
+    printf("Sim50HzSin %dsin(t+%d);\n\r", amp, offset);
     printf("h) Print this info\n\r");
     printf("a ddd) Set amp to ddd\n\r");
     printf("o ddd) Set offset to ddd\n\r");

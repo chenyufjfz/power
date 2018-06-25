@@ -53,18 +53,12 @@ extern void F28x_usDelay(long LoopCount);
 #define CHANNEL 8
 #define COMPUTE_RATE 100
 #define POWER_CYCLE 50
-#define COMPUTE_CYCLE 3
-#define BUF_DMA_RESERVED_COUNT 0
-
-#define ADC_DMA_TRANSFER_SIZE (SAMPLE_RATE / COMPUTE_RATE)
-#define ADC_DMA_CLUSTER_SIZE (ADC_DMA_TRANSFER_SIZE * CHANNEL)
-#define SIN_TABLE_SIZE (SAMPLE_RATE / (POWER_CYCLE * 4) + 1)
-#define COMPUTE_BUF_SIZE (SAMPLE_RATE / POWER_CYCLE * COMPUTE_CYCLE * CHANNEL)
-#define ADC_DMA_CLUSTER_COUNT ( (COMPUTE_BUF_SIZE - 1) / ADC_DMA_CLUSTER_SIZE + 2 + BUF_DMA_RESERVED_COUNT)
+#define COMPUTE_CYCLE 2
+#define BUF_DMA_RESERVED_COUNT 1
+#define UTC_UNIT 1000
 
 //max clock jitter is 100ppm
 #define MAX_CLOCK_JITTER 100
-#define MAX_CLOCK_DIFF (CPU_CLOCK / 1000000 * MAX_CLOCK_JITTER)
 
 #if SAMPLE_RATE % (POWER_CYCLE * 4) != 0
 #error SAMPLE_RATE %  (POWER_CYCLE * 4) !=0
@@ -75,6 +69,8 @@ extern void F28x_usDelay(long LoopCount);
 
 #define PI 3.1415926536
 #define Assert(x) do {while (!(x));} while(0)
+#define min(x, y) ((x) < (y) ? (x) : (y))
+#define max(x, y) ((x) > (y) ? (x) : (y))
 
 class Task {
 public:
@@ -96,33 +92,53 @@ extern MsgTask msg_task;
 #endif
 
 struct TickTime {
-    uint64_t utc_tick, utc_time;
+    uint64_t tick, utc;
+    TickTime(uint64_t _tick, uint64_t _utc) {
+        tick = _tick;
+        utc = _utc;
+    }
+    TickTime() {}
 };
 
 #define DMASYNC_SIZE 3
-#define TICKTIME_SIZE 4
+#define UTCSYNC_SIZE 4
+
 class ADCSync1PPS : public Task {
 protected:
-    bool keep_display;
+    bool keep_display, receive_1pps;
     volatile uint16_t capture_state, sync_state;
-    int16_t sin_tbl[SIN_TABLE_SIZE];
-    uint16_t adc_buf[ADC_DMA_CLUSTER_SIZE * ADC_DMA_CLUSTER_COUNT];
     struct DmaSync {
         int sample_period;
         uint64_t sample_idx;
         uint64_t tick;
-    } dma_sync[DMASYNC_SIZE];
-    TickTime tick_time[TICKTIME_SIZE];
-    volatile uint16_t adc_buf_head, adc_buf_tail;
+    } dma_sync_tbl[DMASYNC_SIZE];
+    TickTime utc_sync_tbl[UTCSYNC_SIZE];
+    uint32_t tick_ps;
+    uint64_t record_utc;
     volatile uint64_t cap1;
+
+    void clear_utc_sync_tbl();
+    void push_utc_sync_tbl(uint64_t tick, uint64_t utc);
+    void clear_dma_sync_tbl();
+    void push_dma_sync_tbl(int sample_period, uint64_t sample_idx, uint64_t tick);
+    void update_tick_ps();
+    void update_record_utc();
 public:
-    void init();
+    static bool compatible(const TickTime & t0, const TickTime & t1, uint32_t _tick_ps, uint32_t max_diff);
+    uint64_t tick2sample(uint64_t tick);
+    uint64_t sample2tick(uint64_t sample);
+    template <class UTC_TYPE> int tick2utc(uint64_t tick, UTC_TYPE & utc);
+    template <class UTC_TYPE> int utc2tick(UTC_TYPE utc, uint64_t & tick);
+    template <class UTC_TYPE> int sample2utc(uint64_t sample, UTC_TYPE & utc);
+    template <class UTC_TYPE> int utc2sample(UTC_TYPE utc, uint64_t & sample);
+
     void set_cap_state(uint16_t cap_state);
     uint64_t get_tick();
     void new_cap_evt();
     void new_cluster_ready();
-    uint16_t * get_adc_buf(int cluster_idx);
+
     void print_helper();
+    void init();
     void process_event();
     int process_cmd(char * user_cmd);
 };
@@ -135,8 +151,7 @@ class UTCSync : public Task {
 protected:
     TickTime prev_tick_time;
 public:
-    static bool compatible(TickTime & t0, TickTime & t1, uint32_t cpu_clock);
-    uint64_t get_1pps_utctime(uint64_t tick, uint32_t cpu_clock);
+    uint64_t get_1pps_utctime(uint64_t tick, uint32_t tick_ps);
     void init();
     void process_event();
 };

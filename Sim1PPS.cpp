@@ -18,7 +18,6 @@ static uint32_t f0, f_var;
 
 // Set Period value 200000000
 #define F0_DEFAULT_CYCLE CPU_CLOCK
-#define F0VAR_MAX (F0_DEFAULT_CYCLE / 10)
 
 #define USEECAP     6
 
@@ -137,7 +136,7 @@ void Sim1PPS::print_helper()
     printf("Sim1PPS\n\r");
     printf("h) Print this info\n\r");
     printf("f ddd) set f to 1 + ddd/10000\n\r");
-    printf("v ddd) set var to ddd/10000\n\r");
+    printf("v ddd) set var to ddd\n\r");
     printf("t) Toggle on/off\n\r");
     printf("e) Exit\n\r");
 }
@@ -156,7 +155,7 @@ int Sim1PPS::process_cmd(char * user_cmd)
         break;
     case 'V':
         if (sscanf(&user_cmd[1], " %d", &a) == 1)
-            f_var = F0VAR_MAX / 10000 * a;
+            f_var = a;
         break;
     case 'T':
         enable_out = !enable_out;
