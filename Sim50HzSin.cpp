@@ -13,6 +13,7 @@
 
 #undef SIN_TABLE_SIZE
 #define SIN_TABLE_SIZE 200
+
 #define TIMER_50HZ (CPU_CLOCK / 50 / SIN_TABLE_SIZE)
 
 #define DMA_CHANNEL  3
@@ -140,7 +141,7 @@ void timer_init()
 {
     // Counter decrements PRD+1 times each period
     //
-    CpuTimer0Regs.PRD.all = TIMER_50HZ;
+    CpuTimer0Regs.PRD.all = TIMER_50HZ - 1;
 
     // Set pre-scale counter to divide by 1 (SYSCLKOUT):
     //
@@ -194,7 +195,7 @@ static void epwm_init()
     // bit 1-0       11:     CTRMODE, 11 = timer stopped (disabled)
 
     epwm->TBCTR = 0x0000;               // Clear timer counter
-    epwm->TBPRD = TIMER_50HZ;      // Set timer period
+    epwm->TBPRD = TIMER_50HZ - 1;      // Set timer period
     epwm->TBPHS.bit.TBPHS = 0x0000;     // Set timer phase
 
     epwm->ETPS.all = 0x0100; // Configure SOCA
@@ -221,7 +222,7 @@ static void epwm_init()
 static void set_waveform(uint16_t amp, uint16_t offset)
 {
     for (uint16_t i=0; i < SIN_TABLE_SIZE; i++) {
-        sine_tbl[i] = (sin((i + offset)*2*PI/SIN_TABLE_SIZE)+1.0) * amp;
+        sine_tbl[i] = (sin(i *2*PI/SIN_TABLE_SIZE + offset * PI / 180)+1.02) * amp;
     }
 }
 

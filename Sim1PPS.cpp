@@ -180,10 +180,10 @@ int Sim1PPS::process_cmd(char * user_cmd)
     default:
         break;
     }
-    b = fix_print(f0/1000, 1000);
+    b = fix_print(f0, 1000);
     c = fix_print(f_var, 1000);
-    d = fix_print(ecap->CAP1/1000, 1000);
-    printf("on=%d, f0=%d.%dM, var=%d.%dK,current=%d.%dM\n\r", enable_out,
+    d = fix_print(ecap->CAP1 + 1, 1000);
+    printf("on=%d, f0=%ld.%ldK, var=%ld,current=%ld.%ldK\n\r", enable_out,
            b.first, b.second, c.first, c.second, d.first, d.second );
     return 0;
 }

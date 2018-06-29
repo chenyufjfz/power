@@ -5,6 +5,7 @@
 **********************************************************************/
 
 #include "task.h"
+#include "F2837xD_Examples.h"
 
 volatile int16_t event_pending = 0;
 
@@ -50,6 +51,8 @@ void main(void)
     PieCtrlRegs.PIECTRL.bit.ENPIE = 1;   // Enable the PIE block
 
     EALLOW;
+    (*Device_cal)(); //calibrate ADC
+
     CpuSysRegs.SECMSEL.bit.PF1SEL = 1;  // Ensure DMA is connected to Peripheral Frame 1 bridge which contains the DAC
 
     DmaRegs.DMACTRL.bit.HARDRESET = 1;  // Perform a hard reset on DMA

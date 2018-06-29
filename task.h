@@ -182,7 +182,7 @@ extern Sim1PPS sim_1pps;
 #ifdef _SIM50HZ_SIN_WITH_PWM_
 class Sim50HzSin {
 protected:
-    uint16_t amp, offset;
+    int16_t amp, offset;
 public:
     void init();
     void print_helper();

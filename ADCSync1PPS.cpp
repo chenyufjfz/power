@@ -81,20 +81,23 @@ static volatile CH_REGS * dma_ch = &DmaRegs.CH3;
 #define ADC_DMA_TRANSFER_SIZE (SAMPLE_RATE / COMPUTE_RATE)
 #define ADC_DMA_CLUSTER_SIZE (ADC_DMA_TRANSFER_SIZE * CHANNEL)
 #define SIN_TABLE_SIZE (SAMPLE_RATE / (POWER_CYCLE * 4) + 1)
-#define COMPUTE_BUF_SIZE (SAMPLE_RATE / POWER_CYCLE * COMPUTE_CYCLE * CHANNEL)
+#define COMPUTE_SAMPLE (SAMPLE_RATE / POWER_CYCLE * COMPUTE_CYCLE)
+#define COMPUTE_BUF_SIZE (COMPUTE_SAMPLE * CHANNEL)
 #define ADC_DMA_CLUSTER_COUNT ( (COMPUTE_BUF_SIZE - 1) / ADC_DMA_CLUSTER_SIZE + 3 + BUF_DMA_RESERVED_COUNT)
 #define ADC_BUF_SIZE (ADC_DMA_CLUSTER_SIZE * ADC_DMA_CLUSTER_COUNT)
 
-#define VI_SHIFT_BIT 9
-#if ((1 << VI_SHIFT_BIT) < (SIN_TABLE_SIZE - 1) * 4 * COMPUTE_CYCLE)
-#error  ((1 << VI_SHIFT_BIT) < (SIN_TABLE_SIZE - 1) * 4 * COMPUTE_CYCLE)
-#error
+#define VI_SHIFT_BIT2 (ADC_RESOLUTION + SIN_AMP_BIT - 1 - 16)
+
+#if ADC_RESOLUTION == 12
+// 100ns
+#define ACQPS_WINDOW 20
+#elif ADC_RESOLUTION == 16
+// 400ns
+#define ACQPS_WINDOW 80
 #endif
 
-#define VI_SHIFT_BIT2 (VI_SHIFT_BIT - (32 - ADC_RESOLUTION - SIN_AMP_BIT - 1))
-#if VI_SHIFT_BIT2 < 0
-#undef VI_SHIFT_BIT2
-#define VI_SHIFT_BIT2 0
+#if (SIN_TABLE_SIZE - 1) > (1 << (32 - ADC_RESOLUTION - SIN_AMP_BIT - 1))
+#error (SIN_TABLE_SIZE - 1) > (1 << (32 - ADC_RESOLUTION - SIN_AMP_BIT - 1))
 #endif
 static uint32_t tick_h32 = 0;
 enum {
@@ -323,16 +326,43 @@ static void adc_init()
 {
     uint16_t which_adc, resolution, signalmode, acqps;
     EALLOW;
-    adc->ADCCTL2.bit.PRESCALE = 0;
+    //--- Reset the ADC.  This is good programming practice.
+    DevCfgRegs.SOFTPRES13.bit.ADC_A = 1;    // ADC is reset
+    DevCfgRegs.SOFTPRES13.bit.ADC_A = 0;    // ADC is released from reset
+
+    //--- Configure the ADC base registers
+    adc->ADCCTL1.all = 0x0004;      // Main ADC configuration
+    // bit 15-14     00:     reserved
+    // bit 13        0:      ADCBSY, ADC busy, read-only
+    // bit 12        0:      reserved
+    // bit 11-8      0's:    ADCBSYCHN, ADC busy channel, read-only
+    // bit 7         0:      ADCPWDNZ, ADC power down, 0=powered down, 1=powered up
+    // bit 6-3       0000:   reserved
+    // bit 2         1:      INTPULSEPOS, INT pulse generation, 0=start of conversion, 1=end of conversion
+    // bit 1-0       00:     reserved
+
+    adc->ADCCTL2.all = 0x0006;      // ADC clock configuration
+    // bit 15-8      0's:    reserved
+    // bit 7         0:      SIGNALMODE, configured by AdcSetMode() below to get calibration correct
+    // bit 6         0:      RESOLUTION, configured by AdcSetMode() below to get calibration correct
+    // bit 5-4       00:     reserved
+    // bit 3-0       0110:   PRESCALE, ADC clock prescaler.  0110=CPUCLK/4
+
+    AdcaRegs.ADCBURSTCTL.all = 0x0000;
+// bit 15        0:      BURSTEN, 0=burst mode disabled, 1=burst mode enabled
+// bit 14-12     000:    reserved
+// bit 11-8      0000:   BURSTSIZE, 0=1 SOC converted (don't care)
+// bit 7-6       00:     reserved
+// bit 5-0       000000: BURSTTRIGSEL, 00=software only (don't care)
 #if ADC_RESOLUTION == 12
     resolution = ADC_RESOLUTION_12BIT;
     signalmode = ADC_SIGNALMODE_SINGLE;
-    acqps = 14; // 75ns
 #else
     resolution = ADC_RESOLUTION_16BIT;
     signalmode = ADC_SIGNALMODE_DIFFERENTIAL;
-    acqps = 63; // 320ns
 #endif
+
+    acqps = ACQPS_WINDOW - 1;
 
 #if USE_ADC ==1
     which_adc = ADC_ADCA;
@@ -343,16 +373,8 @@ static void adc_init()
 #endif
     AdcSetMode(which_adc, resolution, signalmode);
 
-    // Set pulse positions to late
-    //
-    adc->ADCCTL1.bit.INTPULSEPOS = 1;
 
-    // Power up the ADC
-    //
-    adc->ADCCTL1.bit.ADCPWDNZ = 1;
-    F28x_usDelay(20000);
-
-    adc->ADCSOC0CTL.bit.CHSEL  = 2; //Choose ADCIN2, for ADCINA2, it is pin 29
+    adc->ADCSOC0CTL.bit.CHSEL  = 2; //Choose ADCIN2, for ADCINA2, it is pin 29, for ADCINB2 it is pin 28
     adc->ADCSOC1CTL.bit.CHSEL  = 2;
     adc->ADCSOC2CTL.bit.CHSEL  = 2;
     adc->ADCSOC3CTL.bit.CHSEL  = 2;
@@ -403,6 +425,12 @@ static void adc_init()
     adc->ADCINTSEL1N2.bit.INT2CONT = 1;
     adc->ADCINTSEL1N2.bit.INT1SEL = 0;  // End of SOC0
     adc->ADCINTSEL1N2.bit.INT2SEL = 7; // End of SOC7
+
+
+    // Power up the ADC
+    //
+    adc->ADCCTL1.bit.ADCPWDNZ = 1;
+    F28x_usDelay(100000);
 
     EDIS;
 }
@@ -512,22 +540,22 @@ class ComputeVI {
 protected:
     int16_t sin_tbl[SIN_TABLE_SIZE];
     uint16_t adc_buf[ADC_BUF_SIZE];
-    volatile uint64_t adc_sample_tail;
+    volatile uint64_t adc_buf_tail;
 public:
     void init();
     void new_cluster_ready();
     uint64_t get_latest_sample() const {
-        return adc_sample_tail;
+        return adc_buf_tail / CHANNEL;
     }
     uint64_t get_earliest_sample() const {
-        return adc_sample_tail - ADC_BUF_SIZE + 2;
+        return (adc_buf_tail - ADC_BUF_SIZE) / CHANNEL + 2;
     }
     int operator () (VIBuf & vibuf);
 } compute_vi;
 
 void ComputeVI::init()
 {
-    adc_sample_tail = 0;
+    adc_buf_tail = 0;
     sin_table_init(sin_tbl, SIN_TABLE_SIZE);
     dma_init(adc_buf);
 }
@@ -535,8 +563,9 @@ void ComputeVI::init()
 //it run at interrupt context
 void ComputeVI::new_cluster_ready()
 {
-    adc_sample_tail +=ADC_DMA_CLUSTER_SIZE;
-    uint32_t addr = (uint32_t) &adc_buf[adc_sample_tail % ADC_BUF_SIZE];
+    adc_buf_tail +=ADC_DMA_CLUSTER_SIZE;
+
+    uint32_t addr = (uint32_t) &adc_buf[adc_buf_tail % ADC_BUF_SIZE];
     EALLOW;
     dma_ch->DST_ADDR_SHADOW = addr;
     dma_ch->DST_BEG_ADDR_SHADOW = addr;
@@ -557,14 +586,14 @@ enum {
  */
 int ComputeVI::operator() (VIBuf & vibuf)
 {
-    uint64_t valid_tail = adc_sample_tail - ADC_DMA_CLUSTER_SIZE;
-    uint64_t valid_head = adc_sample_tail - ADC_BUF_SIZE + 2;
+    uint64_t valid_tail = (adc_buf_tail - ADC_DMA_CLUSTER_SIZE) / CHANNEL;
+    uint64_t valid_head = (adc_buf_tail - ADC_BUF_SIZE) / CHANNEL + 2;
 
     if (vibuf.t.sample < valid_head) {
         vibuf.t.sample = valid_head;
         return COMPUTEVI_LATE;
     }
-    if (vibuf.t.sample + COMPUTE_BUF_SIZE - 1 > valid_tail) {
+    if (vibuf.t.sample + COMPUTE_SAMPLE - 1 > valid_tail) {
         vibuf.t.sample = valid_head;
         return COMPUTEVI_EARLY;
     }
@@ -618,28 +647,28 @@ int ComputeVI::operator() (VIBuf & vibuf)
         for (int j=0; j<CHANNEL; j++) {
             switch (phase) {
             case 0:
-                vi[j][0] +=vi1[j][0] >> VI_SHIFT_BIT2;
-                vi[j][1] +=vi1[j][1] >> VI_SHIFT_BIT2;
+                vi[j][0] +=vi1[j][0] / (SIN_TABLE_SIZE - 1);
+                vi[j][1] +=vi1[j][1] / (SIN_TABLE_SIZE - 1);
                 break;
             case 1:
-                vi[j][0] +=vi1[j][0] >> VI_SHIFT_BIT2;
-                vi[j][1] -=vi1[j][1] >> VI_SHIFT_BIT2;
+                vi[j][0] +=vi1[j][0] / (SIN_TABLE_SIZE - 1);
+                vi[j][1] -=vi1[j][1] / (SIN_TABLE_SIZE - 1);
                 break;
             case 2:
-                vi[j][0] -=vi1[j][0] >> VI_SHIFT_BIT2;
-                vi[j][1] -=vi1[j][1] >> VI_SHIFT_BIT2;
+                vi[j][0] -=vi1[j][0] / (SIN_TABLE_SIZE - 1);
+                vi[j][1] -=vi1[j][1] / (SIN_TABLE_SIZE - 1);
                 break;
             case 3:
-                vi[j][0] -=vi1[j][0] >> VI_SHIFT_BIT2;
-                vi[j][1] +=vi1[j][1] >> VI_SHIFT_BIT2;
+                vi[j][0] -=vi1[j][0] / (SIN_TABLE_SIZE - 1);
+                vi[j][1] +=vi1[j][1] / (SIN_TABLE_SIZE - 1);
                 break;
             }
         }
     }
 
     for (int j=0; j<CHANNEL; j++) { //A * sin(t+phase)
-        int x = vi[j][0] >> 16; //sin
-        int y = vi[j][1] >> 16; //cos
+        int32_t x = vi[j][0] / (4 * COMPUTE_CYCLE) >> VI_SHIFT_BIT2; //sin
+        int32_t y = vi[j][1] / (4 * COMPUTE_CYCLE) >> VI_SHIFT_BIT2; //cos
         vibuf.vi[j][0] = sqrt(y * y + x * x); //it is A
         vibuf.vi[j][1] = atan2(vi[j][1], vi[j][0]) / PI * 18000; //it is phase
     }
@@ -674,6 +703,7 @@ void ADCSync1PPS::clear_utc_sync_tbl()
         utc_sync_tbl[i].tick = 0;
         utc_sync_tbl[i].utc = 0;
     }
+    printf("clear utc sync table\n\r");
 }
 
 void ADCSync1PPS::push_utc_sync_tbl(uint64_t tick, uint64_t utc)
@@ -726,7 +756,7 @@ void ADCSync1PPS::update_record_utc()
     sample2utc(sample, record_utc);
     record_utc = record_utc / COMPUTE_PERIOD;  //here record_utc is compute cycles
     record_utc = (record_utc + 1) * COMPUTE_PERIOD; //conver record_utc to time
-    printf("update_record_utc %lld", record_utc);
+    printf("update_record_utc %lld\n\r", record_utc);
 }
 /*
  * In tick
@@ -751,7 +781,7 @@ uint64_t ADCSync1PPS::sample2tick(uint64_t sample)
     for (int i=DMASYNC_SIZE-1; i>=0; i--)
         if (sample >= dma_sync_tbl[i].sample_idx && dma_sync_tbl[i].tick!=0) {
             uint64_t ret = (sample - dma_sync_tbl[i].sample_idx) * dma_sync_tbl[i].sample_period;
-            return ret + dma_sync_tbl[i].tick;
+            return ret + dma_sync_tbl[i].tick + ACQPS_WINDOW;
         }
     return 0;
 }
@@ -965,14 +995,15 @@ void ADCSync1PPS::new_cluster_ready()
     switch (sync_state) {
     case SYNC_INIT2:
         sync_state = SYNC_DMA;
+        compute_vi.new_cluster_ready();
         return;
     case SYNC_DMA:
     {
         cap1 = ecap0->CAP1; //assume tick_h32 is 0
-        uint32_t diff = cap1 - dma_sync_tbl[0].tick;
-        Assert(diff % (ADC_DMA_TRANSFER_SIZE * (uint32_t) dma_sync_tbl[0].sample_period) == 0);
+        uint32_t diff = cap1 - dma_sync_tbl[DMASYNC_SIZE - 1].tick;
+        Assert(diff % (ADC_DMA_TRANSFER_SIZE * DEFAULT_SAMPLE_PERIOD) == 0);
         compute_vi.new_cluster_ready();
-        if (compute_vi.get_latest_sample() >= ADC_BUF_SIZE)
+        if (compute_vi.get_latest_sample() >= ADC_BUF_SIZE / CHANNEL)
             sync_state = SYNC_UTC0;
         return;
     }
@@ -1035,7 +1066,7 @@ void ADCSync1PPS::init()
 
 void ADCSync1PPS::process_event()
 {
-    int * p_evt = (int*)&event_pending;
+    int16_t * p_evt = (int16_t*)&event_pending;
     __and(p_evt, ~ADCSYNC_EVENT_MASK);
 
     if (sync_state == SYNC_ENTER) {
@@ -1055,9 +1086,7 @@ void ADCSync1PPS::process_event()
         while (sync_state == SYNC_INIT || sync_state == SYNC_INIT2);    // hold CPU until ecap and dma interrupt finish
 
         //recording 1st sample time base
-        dma_sync_tbl[0].sample_idx = 0;
-        dma_sync_tbl[0].tick = cap1;
-        dma_sync_tbl[0].sample_period = DEFAULT_SAMPLE_PERIOD;
+        push_dma_sync_tbl(DEFAULT_SAMPLE_PERIOD, 0, cap1);
 
         IER = 0x40;
         //now sync== SYNC_DMA, and ecap cap1 interrupt is disabled
@@ -1068,7 +1097,8 @@ void ADCSync1PPS::process_event()
 
         IER = old_ier;
 
-        printf("1st dma sample time=%lu:%lu\n\r", (uint32_t) (dma_sync_tbl[0].tick >> 32), (uint32_t) (dma_sync_tbl[0].tick & 0xffffffff));
+        printf("1st dma sample time=%lu:%lu\n\r", (uint32_t) (dma_sync_tbl[DMASYNC_SIZE -1].tick >> 32),
+               (uint32_t) (dma_sync_tbl[DMASYNC_SIZE - 1].tick & 0xffffffff));
     }
     bool finish=false;
 
@@ -1076,33 +1106,40 @@ void ADCSync1PPS::process_event()
         finish = true;
         if (receive_1pps) {
             receive_1pps = false;
-            uint64_t utc = utc_sync.get_1pps_utctime(cap1, tick_ps);
+            uint64_t utc = utc_sync.get_1pps_utctime(cap1, tick_ps); //get utc time for new arriving 1pps
+            /*
+             * SYNC_UTC0 means utc_sync_tbl has no valid item
+             * SYNC_UTC1 means utc_sync_tbl has 1 valid item
+             * SYNC_UTC2 means utc_sync_tbl has >= 2 valid item
+             */
             switch (sync_state) {
             case SYNC_UTC0:
-                if (utc!=0 && utc!=0xffffffffffffffff) {
+                if (utc!=0 && utc!=0xffffffffffffffff) { //got valid utc, change to SYNC_UTC1
                     push_utc_sync_tbl(cap1, utc);
-                    update_record_utc();
                     sync_state = SYNC_UTC1;
                 }
                 break;
+
             case SYNC_UTC1:
             case SYNC_UTC2:
-                if (utc==0) {
+                if (utc==0) { //utc=0 means lost utc time
                     clear_utc_sync_tbl();
                     sync_state = SYNC_UTC0;
                 }
                 else
-                if (utc!=0xffffffffffffffff) {
+                if (utc!=0xffffffffffffffff) { //utc=0xffffffffffffffff means no utc available
                     if (!compatible(utc_sync_tbl[UTCSYNC_SIZE - 1], TickTime(cap1, utc), tick_ps, MAX_CLOCK_DIFF)) {
+                        printf("tick diff=%lld, utc diff=%lld, tick_ps=%ld\n\r", cap1 - utc_sync_tbl[UTCSYNC_SIZE - 1].tick,
+                               utc - utc_sync_tbl[UTCSYNC_SIZE - 1].utc, tick_ps); //not compatible with previous one, maybe 1pps signal or crystal error
                         clear_utc_sync_tbl();
-                        update_record_utc();
                         sync_state = SYNC_UTC1;
+                        push_utc_sync_tbl(cap1, utc);
                     }
-                    else {
+                    else { //has at least 2 valid item, update tick_ps
                         sync_state = SYNC_UTC2;
+                        push_utc_sync_tbl(cap1, utc);
                         update_tick_ps();
                     }
-                    push_utc_sync_tbl(cap1, utc);
                 }
                 break;
             }
@@ -1128,18 +1165,31 @@ void ADCSync1PPS::process_event()
                 if (ret == COMPUTEVI_INTIME) {
                     long double actual_utc;
                     sample2utc(vibuf.t.sample, actual_utc);
-                    actual_utc -= record_utc;
-                    int16_t phase_adjust = actual_utc * (POWER_CYCLE * 36000 / UTC_UNIT);
-                    for (int j=0; j<CHANNEL; j++)
-                        vibuf.vi[j][1] -= phase_adjust;
-                    if (record_utc % 1000 == 0) {
-                        for (int j=0; j<CHANNEL; j++)
-                            printf("(%d,%d),", vibuf.vi[j][0], vibuf.vi[j][1]);
-                        printf("\n\r");
+                    actual_utc -= utc_sync_tbl[UTCSYNC_SIZE-1].utc;
+                    actual_utc = actual_utc / UTC_UNIT * POWER_CYCLE;
+                    actual_utc -= (int64_t) actual_utc;
+                    int32_t phase_adjust = actual_utc * 36000;
+                    for (int j=0; j<CHANNEL; j++) {
+                        int32_t phase = (int) vibuf.vi[j][1] - phase_adjust;
+                        while (phase < -18000)
+                            phase += 36000;
+                        while (phase >= 18000)
+                            phase -= 36000;
+                        vibuf.vi[j][1] = phase;
+                    }
+                    if (record_utc % 1000 == 0 || record_utc % 1000 == 10) {
+                        for (int j=1; j<3; j++)
+                            printf("(%d,%d.%2d),", vibuf.vi[j][0], vibuf.vi[j][1] / 100, abs(vibuf.vi[j][1] % 100));
+                        printf("pa=%d, tick_ps=%ld\n\r", phase_adjust, tick_ps);
                     }
                     record_utc = record_utc + COMPUTE_PERIOD;
                     finish = false;
                 }
+            }
+            else { //WRONG estimate
+                update_record_utc();
+                finish = false;
+
             }
         }
     }
