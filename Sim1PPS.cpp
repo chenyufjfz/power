@@ -3,6 +3,7 @@
  *
  *  Created on: May 28, 2018
  *      Author: yuchen
+ *  It use outputxbar3 sim 1pps (pin 35)
  */
 
 #define _SIM1PPS_
@@ -11,6 +12,7 @@
 #include <stdlib.h>
 #include <utility>
 
+#define GPIO_SIM_1PPS 5
 #ifdef _SIM1PPS_WITH_PWM_
 
 Sim1PPS sim_1pps;
@@ -43,7 +45,9 @@ static volatile ECAP_REGS * ecap = &ECap6Regs;
 static interrupt void ecap_1pps_isr(void)
 {
     float a = rand() * 2.0 / RAND_MAX - 1; //generate rand a in [-1, 1]
-    uint32_t f = f0 + f_var * a;              //f = f0 + var
+    uint32_t f = f0;
+    if (f_var!=0)
+        f += f_var * a;              //f = f0 + var
     ecap->CAP1 = f - 1;
     ecap->CAP2 = f /2;                   // Set Compare value
     ecap->ECCLR.bit.CTR_PRD = 1;    //clear period interrupt flag
@@ -76,34 +80,45 @@ void Sim1PPS::init()
     PieVectTable.ECAP1_INT = ecap_1pps_isr;    // Install ecap isr
     PieCtrlRegs.PIEIER4.bit.INTx1 = 1;  //PIEIER4.1 is ECAP1
 #elif USEECAP == 2
-    OutputXbarRegs.OUTPUT3MUX0TO15CFG.bit.MUX2 = 3; // Select ECAP1.OUT on Mux0, see hardware_reg table 8.3
+    OutputXbarRegs.OUTPUT3MUX0TO15CFG.bit.MUX2 = 3; // Select ECAP2.OUT on Mux0, see hardware_reg table 8.3
     OutputXbarRegs.OUTPUT3MUXENABLE.bit.MUX2 = enable_out;  // Enable MUX0 for ECAP1.OUT
     PieVectTable.ECAP2_INT = ecap_1pps_isr;    // Install ecap isr
     PieCtrlRegs.PIEIER4.bit.INTx2 = 1;  //PIEIER4.2 is ECAP2
 #elif USEECAP == 3
-    OutputXbarRegs.OUTPUT3MUX0TO15CFG.bit.MUX4 = 3; // Select ECAP1.OUT on Mux0, see hardware_reg table 8.3
+    OutputXbarRegs.OUTPUT3MUX0TO15CFG.bit.MUX4 = 3; // Select ECAP3.OUT on Mux0, see hardware_reg table 8.3
     OutputXbarRegs.OUTPUT3MUXENABLE.bit.MUX4 = enable_out;  // Enable MUX0 for ECAP1.OUT
     PieVectTable.ECAP3_INT = ecap_1pps_isr;    // Install ecap isr
     PieCtrlRegs.PIEIER4.bit.INTx3 = 1;  //PIEIER4.3 is ECAP3
 #elif USEECAP == 4
-    OutputXbarRegs.OUTPUT3MUX0TO15CFG.bit.MUX6 = 3; // Select ECAP1.OUT on Mux0, see hardware_reg table 8.3
+    OutputXbarRegs.OUTPUT3MUX0TO15CFG.bit.MUX6 = 3; // Select ECAP4.OUT on Mux0, see hardware_reg table 8.3
     OutputXbarRegs.OUTPUT3MUXENABLE.bit.MUX6 = enable_out;  // Enable MUX0 for ECAP1.OUT
     PieVectTable.ECAP4_INT = ecap_1pps_isr;    // Install ecap isr
     PieCtrlRegs.PIEIER4.bit.INTx4 = 1;  //PIEIER4.4 is ECAP3
 #elif USEECAP == 5
-    OutputXbarRegs.OUTPUT3MUX0TO15CFG.bit.MUX8 = 3; // Select ECAP1.OUT on Mux0, see hardware_reg table 8.3
+    OutputXbarRegs.OUTPUT3MUX0TO15CFG.bit.MUX8 = 3; // Select ECAP5.OUT on Mux0, see hardware_reg table 8.3
     OutputXbarRegs.OUTPUT3MUXENABLE.bit.MUX8 = enable_out;  // Enable MUX0 for ECAP1.OUT
     PieVectTable.ECAP5_INT = ecap_1pps_isr;    // Install ecap isr
     PieCtrlRegs.PIEIER4.bit.INTx5 = 1;  //PIEIER4.5 is ECAP3
 #elif USEECAP == 6
-    OutputXbarRegs.OUTPUT3MUX0TO15CFG.bit.MUX10 = 3; // Select ECAP1.OUT on Mux0, see hardware_reg table 8.3
+    OutputXbarRegs.OUTPUT3MUX0TO15CFG.bit.MUX10 = 3; // Select ECAP6.OUT on Mux0, see hardware_reg table 8.3
     OutputXbarRegs.OUTPUT3MUXENABLE.bit.MUX10 = enable_out;  // Enable MUX0 for ECAP1.OUT
     PieVectTable.ECAP6_INT = ecap_1pps_isr;    // Install ecap isr
     PieCtrlRegs.PIEIER4.bit.INTx6 = 1;  //PIEIER4.6 is ECAP3
 #endif
 
-    GpioCtrlRegs.GPAMUX1.bit.GPIO5 = 3;    // Select OUTPUTXBAR3 on GPIO5,pin 35
-
+#if GPIO_SIM_1PPS == 5
+    GpioCtrlRegs.GPAPUD.bit.GPIO5 = 1;     //disable pull up
+    GpioCtrlRegs.GPAGMUX1.bit.GPIO5 = 0;
+    GpioCtrlRegs.GPAMUX1.bit.GPIO5 = 3;    // Select OUTPUTXBAR3 on GPIO5,pin 35, see pin mux table 4.3
+#elif GPIO_SIM_1PPS == 14
+    GpioCtrlRegs.GPAPUD.bit.GPIO14 = 1;
+    GpioCtrlRegs.GPAGMUX1.bit.GPIO14 = 1;
+    GpioCtrlRegs.GPAMUX1.bit.GPIO14 = 2;    // Select OUTPUTXBAR3 on GPIO14,pin , see pin mux table 4.3
+#elif GPIO_SIM_1PPS == 26
+    GpioCtrlRegs.GPAPUD.bit.GPIO26 = 1;
+    GpioCtrlRegs.GPAGMUX1.bit.GPIO26 = 0;
+    GpioCtrlRegs.GPAMUX1.bit.GPIO26 = 1;    // Select OUTPUTXBAR3 on GPIO26,pin , see pin mux table 4.3
+#endif
     f0 = F0_DEFAULT_CYCLE;
     f_var = 0;
     ecap->CAP1 = f0;
@@ -126,7 +141,7 @@ void Sim1PPS::init()
     IER |= 0x8;     //eCAPx is ACK4
 }
 
-std::pair<uint16_t, uint16_t> fix_print(uint32_t a, uint32_t unit)
+std::pair<uint32_t, uint32_t> fix_print(uint32_t a, uint32_t unit)
 {
     return std::make_pair(a / unit, a % unit);
 }
@@ -135,7 +150,7 @@ void Sim1PPS::print_helper()
 {
     printf("Sim1PPS\n\r");
     printf("h) Print this info\n\r");
-    printf("f ddd) set f to 1 + ddd/10000\n\r");
+    printf("f ddd) set f to 1 + ddd/1000000\n\r");
     printf("v ddd) set var to ddd\n\r");
     printf("t) Toggle on/off\n\r");
     printf("e) Exit\n\r");
@@ -144,14 +159,14 @@ void Sim1PPS::print_helper()
 int Sim1PPS::process_cmd(char * user_cmd)
 {
     int16_t a = 0;
-    std::pair<uint16_t, uint16_t> b,c,d;
+    std::pair<uint32_t, uint32_t> b,c,d;
     switch (toupper(user_cmd[0])) {
     case 'H':
         print_helper();
         break;
     case 'F':
         if (sscanf(&user_cmd[1], " %d", &a) == 1)
-            f0 = F0_DEFAULT_CYCLE +  F0_DEFAULT_CYCLE / 10000 * a;
+            f0 = F0_DEFAULT_CYCLE +  F0_DEFAULT_CYCLE / 1000000 * a;
         break;
     case 'V':
         if (sscanf(&user_cmd[1], " %d", &a) == 1)
@@ -181,10 +196,9 @@ int Sim1PPS::process_cmd(char * user_cmd)
         break;
     }
     b = fix_print(f0, 1000);
-    c = fix_print(f_var, 1000);
     d = fix_print(ecap->CAP1 + 1, 1000);
-    printf("on=%d, f0=%ld.%ldK, var=%ld,current=%ld.%ldK\n\r", enable_out,
-           b.first, b.second, c.first, c.second, d.first, d.second );
+    printf("on=%d, f0=%ld.%ldK, var=%ld, current=%ld.%ldK\n\r", enable_out,
+           b.first, b.second, f_var, d.first, d.second );
     return 0;
 }
 #endif

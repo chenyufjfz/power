@@ -105,7 +105,8 @@ struct TickTime {
 
 class ADCSync1PPS : public Task {
 protected:
-    bool keep_display, receive_1pps;
+    bool keep_display;
+    int receive_1pps_epwm;
     volatile uint16_t capture_state, sync_state;
     struct DmaSync {
         int sample_period;
@@ -113,8 +114,9 @@ protected:
         uint64_t tick;
     } dma_sync_tbl[DMASYNC_SIZE];
     TickTime utc_sync_tbl[UTCSYNC_SIZE];
-    uint32_t tick_ps;
-    uint64_t record_utc;
+    uint32_t tick_ps; //tick per utc second
+    uint32_t tick_pc; //tick per power cycel
+    uint64_t record_utc; //adc buffer head
     volatile uint64_t cap1;
 
     void clear_utc_sync_tbl();

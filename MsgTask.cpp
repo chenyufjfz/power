@@ -215,8 +215,8 @@ void scia_init()
     SciaRegs.SCICTL2.all = 0x0003; // Tx interrupt and Rx interrupt
 
     //
-    // SCIA at 38400 115200 baud
-    // @LSPCLK = 50 MHz (200 MHz SYSCLK) HBAUD = 0x00 and LBAUD = 0xA2.
+    // SCIA at 115200 baud
+    // @LSPCLK = 50 MHz (200 MHz SYSCLK) HBAUD = 0x00 and LBAUD = 0x36.
     //
     SciaRegs.SCIHBAUD.all = 0x0000;
     SciaRegs.SCILBAUD.all = 0x0036;

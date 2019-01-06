@@ -3,6 +3,7 @@
  *
  *  Created on: Jun 3, 2018
  *      Author: yuchen
+ *  It use pin 30
  */
 
 #define _Sim50HzSin_
@@ -12,7 +13,7 @@
 #include "math.h"
 
 #undef SIN_TABLE_SIZE
-#define SIN_TABLE_SIZE 200
+#define SIN_TABLE_SIZE 2000
 
 #define TIMER_50HZ (CPU_CLOCK / 50 / SIN_TABLE_SIZE)
 
@@ -242,10 +243,11 @@ void Sim50HzSin::init()
 
 void Sim50HzSin::print_helper()
 {
-    printf("Sim50HzSin %dsin(t+%d);\n\r", amp, offset);
+    printf("Sim50HzSin %dsin(t/%d+%d);\n\r", amp, epwm->TBPRD + 1, offset);
     printf("h) Print this info\n\r");
     printf("a ddd) Set amp to ddd\n\r");
-    printf("o ddd) Set offset to ddd\n\r");
+    printf("o ddd) Set offset to ddd degree\n\r");
+    printf("t ddd) Set Period to ddd");
     printf("e) Exit\n\r");
 }
 
@@ -269,12 +271,16 @@ int Sim50HzSin::process_cmd(char * user_cmd)
             set_waveform(amp, offset);
         }
         break;
+    case 'T':
+        if (sscanf(&user_cmd[1], " %d", &a) == 1)
+            epwm->TBPRD = a - 1;
+        break;
     case 'E':
         return 1;
     default:
         break;
     }
-    printf("amp=%d, offset=%d\n\r", amp, offset);
+    printf("amp=%d, T=%d, offset=%d\n\r", amp, epwm->TBPRD + 1, offset);
     return 0;
 }
 #endif
